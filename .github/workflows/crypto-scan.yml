@@ -26,7 +26,7 @@ jobs:
 
       - name: Run market structure scanner
         env:
-          EXCHANGE_ID: binance
+          EXCHANGE_ID: kucoin
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
