@@ -1,0 +1,25 @@
+{
+  "symbols": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "DOGE/USDT",
+    "LINK/USDT",
+    "SUI/USDT"
+  ],
+  "higher_timeframe": "4h",
+  "setup_timeframe": "1h",
+  "entry_timeframe": "15m",
+  "candle_limit": 500,
+  "swing_left": 3,
+  "swing_right": 3,
+  "volume_sma_period": 20,
+  "atr_period": 14,
+  "minimum_volume_ratio": 1.1,
+  "pullback_atr_tolerance": 0.4,
+  "stop_atr_buffer": 0.2,
+  "minimum_rr": 2.0,
+  "signal_cooldown_minutes": 180
+}
