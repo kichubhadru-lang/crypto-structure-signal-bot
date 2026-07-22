@@ -1,11 +1,8 @@
-
 from __future__ import annotations
 
 import json
 import logging
 import os
-import sqlite3
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -14,22 +11,25 @@ import ccxt
 import numpy as np
 import pandas as pd
 import requests
-from dotenv import load_dotenv
+
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("structure-bot")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+log = logging.getLogger("crypto-structure-bot")
 
 
 @dataclass(frozen=True)
-class Structure:
+class MarketStructure:
     direction: Literal["bullish", "bearish", "range", "unknown"]
-    last_swing_high: Optional[float]
-    previous_swing_high: Optional[float]
-    last_swing_low: Optional[float]
-    previous_swing_low: Optional[float]
+    latest_high: Optional[float]
+    previous_high: Optional[float]
+    latest_low: Optional[float]
+    previous_low: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -37,275 +37,634 @@ class Signal:
     symbol: str
     side: Literal["BUY", "SELL"]
     entry: float
-    stop: float
+    stop_loss: float
     target_1: float
     target_2: float
-    reasons: tuple[str, ...]
     candle_timestamp: int
+    reasons: tuple[str, ...]
 
 
 def load_config() -> dict:
-    with open(BASE_DIR / "config.json", "r", encoding="utf-8") as f:
-        return json.load(f)
+    config_path = BASE_DIR / "config.json"
+
+    if not config_path.exists():
+        raise FileNotFoundError("config.json was not found")
+
+    with config_path.open("r", encoding="utf-8") as file:
+        return json.load(file)
 
 
-def make_exchange(exchange_id: str):
+def create_exchange(exchange_id: str):
     exchange_class = getattr(ccxt, exchange_id, None)
+
     if exchange_class is None:
         raise ValueError(f"Unsupported exchange: {exchange_id}")
-    exchange = exchange_class({"enableRateLimit": True})
+
+    exchange = exchange_class(
+        {
+            "enableRateLimit": True,
+            "timeout": 30000,
+        }
+    )
+
     exchange.load_markets()
     return exchange
 
 
-def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-    rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if len(rows) < 100:
-        raise RuntimeError(f"Insufficient candles for {symbol} {timeframe}")
-    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    return df.astype({
-        "timestamp": "int64", "open": "float64", "high": "float64",
-        "low": "float64", "close": "float64", "volume": "float64"
-    })
-
-
-def add_atr(df: pd.DataFrame, period: int) -> pd.DataFrame:
-    out = df.copy()
-    prev_close = out["close"].shift(1)
-    tr = pd.concat([
-        out["high"] - out["low"],
-        (out["high"] - prev_close).abs(),
-        (out["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    out["atr"] = tr.rolling(period).mean()
-    return out
-
-
-def mark_swings(df: pd.DataFrame, left: int, right: int) -> pd.DataFrame:
-    out = df.copy()
-    window = left + right + 1
-    out["swing_high"] = out["high"].eq(
-        out["high"].rolling(window, center=True).max()
+def fetch_candles(
+    exchange,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+) -> pd.DataFrame:
+    candles = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=limit,
     )
-    out["swing_low"] = out["low"].eq(
-        out["low"].rolling(window, center=True).min()
+
+    if len(candles) < 100:
+        raise RuntimeError(
+            f"Not enough candle data for {symbol} on {timeframe}"
+        )
+
+    dataframe = pd.DataFrame(
+        candles,
+        columns=[
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ],
     )
-    return out
+
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+
+    dataframe[numeric_columns] = dataframe[numeric_columns].astype(float)
+    dataframe["timestamp"] = dataframe["timestamp"].astype("int64")
+
+    # Remove the currently forming candle.
+    return dataframe.iloc[:-1].copy()
 
 
-def detect_structure(df: pd.DataFrame, left: int, right: int) -> Structure:
-    marked = mark_swings(df, left, right)
-    highs = marked.loc[marked["swing_high"], "high"].dropna()
-    lows = marked.loc[marked["swing_low"], "low"].dropna()
+def add_atr(
+    dataframe: pd.DataFrame,
+    period: int,
+) -> pd.DataFrame:
+    output = dataframe.copy()
 
-    if len(highs) < 2 or len(lows) < 2:
-        return Structure("unknown", None, None, None, None)
+    previous_close = output["close"].shift(1)
 
-    prev_high, last_high = float(highs.iloc[-2]), float(highs.iloc[-1])
-    prev_low, last_low = float(lows.iloc[-2]), float(lows.iloc[-1])
+    true_range = pd.concat(
+        [
+            output["high"] - output["low"],
+            (output["high"] - previous_close).abs(),
+            (output["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
-    if last_high > prev_high and last_low > prev_low:
+    output["atr"] = true_range.rolling(period).mean()
+
+    return output
+
+
+def mark_swings(
+    dataframe: pd.DataFrame,
+    left_bars: int,
+    right_bars: int,
+) -> pd.DataFrame:
+    output = dataframe.copy()
+
+    window = left_bars + right_bars + 1
+
+    highest_value = output["high"].rolling(
+        window=window,
+        center=True,
+    ).max()
+
+    lowest_value = output["low"].rolling(
+        window=window,
+        center=True,
+    ).min()
+
+    output["swing_high"] = output["high"].eq(highest_value)
+    output["swing_low"] = output["low"].eq(lowest_value)
+
+    return output
+
+
+def detect_market_structure(
+    dataframe: pd.DataFrame,
+    left_bars: int,
+    right_bars: int,
+) -> MarketStructure:
+    marked = mark_swings(
+        dataframe,
+        left_bars,
+        right_bars,
+    )
+
+    swing_highs = marked.loc[
+        marked["swing_high"],
+        "high",
+    ].dropna()
+
+    swing_lows = marked.loc[
+        marked["swing_low"],
+        "low",
+    ].dropna()
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return MarketStructure(
+            direction="unknown",
+            latest_high=None,
+            previous_high=None,
+            latest_low=None,
+            previous_low=None,
+        )
+
+    previous_high = float(swing_highs.iloc[-2])
+    latest_high = float(swing_highs.iloc[-1])
+
+    previous_low = float(swing_lows.iloc[-2])
+    latest_low = float(swing_lows.iloc[-1])
+
+    if latest_high > previous_high and latest_low > previous_low:
         direction = "bullish"
-    elif last_high < prev_high and last_low < prev_low:
+
+    elif latest_high < previous_high and latest_low < previous_low:
         direction = "bearish"
+
     else:
         direction = "range"
 
-    return Structure(direction, last_high, prev_high, last_low, prev_low)
-
-
-def crossed_above(series: pd.Series, level: float) -> bool:
-    return bool(series.iloc[-2] <= level < series.iloc[-1])
-
-
-def crossed_below(series: pd.Series, level: float) -> bool:
-    return bool(series.iloc[-2] >= level > series.iloc[-1])
-
-
-def generate_signal(exchange, symbol: str, cfg: dict) -> Optional[Signal]:
-    limit = int(cfg["candle_limit"])
-    htf = fetch_ohlcv(exchange, symbol, cfg["higher_timeframe"], limit)
-    setup = fetch_ohlcv(exchange, symbol, cfg["setup_timeframe"], limit)
-    entry = fetch_ohlcv(exchange, symbol, cfg["entry_timeframe"], limit)
-
-    left, right = int(cfg["swing_left"]), int(cfg["swing_right"])
-    htf_structure = detect_structure(htf, left, right)
-    setup_structure = detect_structure(setup, left, right)
-
-    if htf_structure.direction not in ("bullish", "bearish"):
-        return None
-    if setup_structure.direction != htf_structure.direction:
-        return None
-
-    entry = add_atr(entry, int(cfg["atr_period"]))
-    entry["volume_sma"] = entry["volume"].rolling(int(cfg["volume_sma_period"])).mean()
-
-    last = entry.iloc[-1]
-    atr = float(last["atr"]) if pd.notna(last["atr"]) else np.nan
-    volume_sma = float(last["volume_sma"]) if pd.notna(last["volume_sma"]) else np.nan
-    if not np.isfinite(atr) or not np.isfinite(volume_sma) or atr <= 0:
-        return None
-
-    volume_ratio = float(last["volume"] / volume_sma) if volume_sma > 0 else 0.0
-    if volume_ratio < float(cfg["minimum_volume_ratio"]):
-        return None
-
-    marked_entry = mark_swings(entry, left, right)
-    swing_highs = marked_entry.loc[marked_entry["swing_high"], "high"].dropna()
-    swing_lows = marked_entry.loc[marked_entry["swing_low"], "low"].dropna()
-    if len(swing_highs) < 1 or len(swing_lows) < 1:
-        return None
-
-    recent_high = float(swing_highs.iloc[-1])
-    recent_low = float(swing_lows.iloc[-1])
-    close = float(last["close"])
-    tolerance = atr * float(cfg["pullback_atr_tolerance"])
-    stop_buffer = atr * float(cfg["stop_atr_buffer"])
-    min_rr = float(cfg["minimum_rr"])
-
-    if htf_structure.direction == "bullish":
-        # BOS must have occurred recently; current candle should hold/reclaim the broken level.
-        recent_bos = (entry["close"].tail(8) > recent_high).any()
-        retest = abs(close - recent_high) <= tolerance or close > recent_high
-        bullish_candle = close > float(last["open"])
-        if not (recent_bos and retest and bullish_candle):
-            return None
-
-        stop = min(recent_low, recent_high - atr) - stop_buffer
-        risk = close - stop
-        if risk <= 0:
-            return None
-        return Signal(
-            symbol=symbol, side="BUY", entry=close, stop=stop,
-            target_1=close + risk * min_rr,
-            target_2=close + risk * (min_rr + 1.0),
-            reasons=(
-                f"4H structure: {htf_structure.direction}",
-                f"1H structure: {setup_structure.direction}",
-                "15m bullish BOS/retest",
-                f"Volume: {volume_ratio:.2f}x average",
-            ),
-            candle_timestamp=int(last["timestamp"]),
-        )
-
-    recent_bos = (entry["close"].tail(8) < recent_low).any()
-    retest = abs(close - recent_low) <= tolerance or close < recent_low
-    bearish_candle = close < float(last["open"])
-    if not (recent_bos and retest and bearish_candle):
-        return None
-
-    stop = max(recent_high, recent_low + atr) + stop_buffer
-    risk = stop - close
-    if risk <= 0:
-        return None
-    return Signal(
-        symbol=symbol, side="SELL", entry=close, stop=stop,
-        target_1=close - risk * min_rr,
-        target_2=close - risk * (min_rr + 1.0),
-        reasons=(
-            f"4H structure: {htf_structure.direction}",
-            f"1H structure: {setup_structure.direction}",
-            "15m bearish BOS/retest",
-            f"Volume: {volume_ratio:.2f}x average",
-        ),
-        candle_timestamp=int(last["timestamp"]),
+    return MarketStructure(
+        direction=direction,
+        latest_high=latest_high,
+        previous_high=previous_high,
+        latest_low=latest_low,
+        previous_low=previous_low,
     )
 
 
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(BASE_DIR / "signals.db")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            candle_timestamp INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            UNIQUE(symbol, side, candle_timestamp)
-        )
-    """)
-    conn.commit()
-    return conn
+def get_entry_levels(
+    dataframe: pd.DataFrame,
+    left_bars: int,
+    right_bars: int,
+    recent_window: int,
+) -> tuple[Optional[float], Optional[float]]:
+    if len(dataframe) <= recent_window + 20:
+        return None, None
+
+    historical_data = dataframe.iloc[:-recent_window].copy()
+
+    marked = mark_swings(
+        historical_data,
+        left_bars,
+        right_bars,
+    )
+
+    swing_highs = marked.loc[
+        marked["swing_high"],
+        "high",
+    ].dropna()
+
+    swing_lows = marked.loc[
+        marked["swing_low"],
+        "low",
+    ].dropna()
+
+    if swing_highs.empty or swing_lows.empty:
+        return None, None
+
+    return (
+        float(swing_highs.iloc[-1]),
+        float(swing_lows.iloc[-1]),
+    )
 
 
-def signal_is_new(conn: sqlite3.Connection, signal: Signal, cooldown_minutes: int) -> bool:
-    row = conn.execute(
-        "SELECT created_at FROM signals WHERE symbol=? AND side=? ORDER BY created_at DESC LIMIT 1",
-        (signal.symbol, signal.side),
-    ).fetchone()
-    now = int(time.time())
-    if row and now - int(row[0]) < cooldown_minutes * 60:
-        return False
-    try:
-        conn.execute(
-            "INSERT INTO signals(symbol, side, candle_timestamp, created_at) VALUES(?,?,?,?)",
-            (signal.symbol, signal.side, signal.candle_timestamp, now),
+def generate_signal(
+    exchange,
+    symbol: str,
+    config: dict,
+) -> Optional[Signal]:
+    candle_limit = int(config["candle_limit"])
+
+    higher_timeframe_data = fetch_candles(
+        exchange,
+        symbol,
+        config["higher_timeframe"],
+        candle_limit,
+    )
+
+    setup_timeframe_data = fetch_candles(
+        exchange,
+        symbol,
+        config["setup_timeframe"],
+        candle_limit,
+    )
+
+    entry_timeframe_data = fetch_candles(
+        exchange,
+        symbol,
+        config["entry_timeframe"],
+        candle_limit,
+    )
+
+    left_bars = int(config["swing_left"])
+    right_bars = int(config["swing_right"])
+
+    higher_structure = detect_market_structure(
+        higher_timeframe_data,
+        left_bars,
+        right_bars,
+    )
+
+    setup_structure = detect_market_structure(
+        setup_timeframe_data,
+        left_bars,
+        right_bars,
+    )
+
+    if higher_structure.direction not in ("bullish", "bearish"):
+        log.info(
+            "%s | 4H structure is %s",
+            symbol,
+            higher_structure.direction,
         )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+        return None
+
+    if setup_structure.direction != higher_structure.direction:
+        log.info(
+            "%s | Structure conflict: 4H=%s, 1H=%s",
+            symbol,
+            higher_structure.direction,
+            setup_structure.direction,
+        )
+        return None
+
+    entry_timeframe_data = add_atr(
+        entry_timeframe_data,
+        int(config["atr_period"]),
+    )
+
+    volume_period = int(config["volume_sma_period"])
+
+    entry_timeframe_data["volume_average"] = (
+        entry_timeframe_data["volume"]
+        .rolling(volume_period)
+        .mean()
+    )
+
+    latest_candle = entry_timeframe_data.iloc[-1]
+
+    atr = float(latest_candle["atr"])
+    average_volume = float(latest_candle["volume_average"])
+
+    if not np.isfinite(atr) or atr <= 0:
+        return None
+
+    if not np.isfinite(average_volume) or average_volume <= 0:
+        return None
+
+    volume_ratio = (
+        float(latest_candle["volume"]) / average_volume
+    )
+
+    minimum_volume_ratio = float(
+        config["minimum_volume_ratio"]
+    )
+
+    if volume_ratio < minimum_volume_ratio:
+        log.info(
+            "%s | Volume too low: %.2fx",
+            symbol,
+            volume_ratio,
+        )
+        return None
+
+    recent_window = int(config["recent_bos_window"])
+
+    structure_high, structure_low = get_entry_levels(
+        entry_timeframe_data,
+        left_bars,
+        right_bars,
+        recent_window,
+    )
+
+    if structure_high is None or structure_low is None:
+        return None
+
+    recent_candles = entry_timeframe_data.tail(
+        recent_window
+    )
+
+    current_open = float(latest_candle["open"])
+    current_high = float(latest_candle["high"])
+    current_low = float(latest_candle["low"])
+    current_close = float(latest_candle["close"])
+
+    pullback_tolerance = (
+        atr * float(config["pullback_atr_tolerance"])
+    )
+
+    stop_buffer = (
+        atr * float(config["stop_atr_buffer"])
+    )
+
+    minimum_risk_reward = float(config["minimum_rr"])
+
+    if higher_structure.direction == "bullish":
+        bos_occurred = bool(
+            (recent_candles["close"] > structure_high).any()
+        )
+
+        retest_occurred = (
+            current_low
+            <= structure_high + pullback_tolerance
+            and current_close > structure_high
+        )
+
+        bullish_confirmation = current_close > current_open
+
+        if not (
+            bos_occurred
+            and retest_occurred
+            and bullish_confirmation
+        ):
+            log.info(
+                "%s | No qualified bullish BOS and retest",
+                symbol,
+            )
+            return None
+
+        stop_loss = min(
+            structure_low,
+            structure_high - atr,
+        ) - stop_buffer
+
+        risk = current_close - stop_loss
+
+        if risk <= 0:
+            return None
+
+        target_1 = (
+            current_close
+            + risk * minimum_risk_reward
+        )
+
+        target_2 = (
+            current_close
+            + risk * (minimum_risk_reward + 1)
+        )
+
+        return Signal(
+            symbol=symbol,
+            side="BUY",
+            entry=current_close,
+            stop_loss=stop_loss,
+            target_1=target_1,
+            target_2=target_2,
+            candle_timestamp=int(
+                latest_candle["timestamp"]
+            ),
+            reasons=(
+                "4H bullish HH/HL structure",
+                "1H bullish structure confirmation",
+                "15m bullish break of structure",
+                "15m retest held above structure",
+                f"Volume {volume_ratio:.2f}x average",
+            ),
+        )
+
+    bos_occurred = bool(
+        (recent_candles["close"] < structure_low).any()
+    )
+
+    retest_occurred = (
+        current_high
+        >= structure_low - pullback_tolerance
+        and current_close < structure_low
+    )
+
+    bearish_confirmation = current_close < current_open
+
+    if not (
+        bos_occurred
+        and retest_occurred
+        and bearish_confirmation
+    ):
+        log.info(
+            "%s | No qualified bearish BOS and retest",
+            symbol,
+        )
+        return None
+
+    stop_loss = max(
+        structure_high,
+        structure_low + atr,
+    ) + stop_buffer
+
+    risk = stop_loss - current_close
+
+    if risk <= 0:
+        return None
+
+    target_1 = (
+        current_close
+        - risk * minimum_risk_reward
+    )
+
+    target_2 = (
+        current_close
+        - risk * (minimum_risk_reward + 1)
+    )
+
+    return Signal(
+        symbol=symbol,
+        side="SELL",
+        entry=current_close,
+        stop_loss=stop_loss,
+        target_1=target_1,
+        target_2=target_2,
+        candle_timestamp=int(
+            latest_candle["timestamp"]
+        ),
+        reasons=(
+            "4H bearish LH/LL structure",
+            "1H bearish structure confirmation",
+            "15m bearish break of structure",
+            "15m retest rejected below structure",
+            f"Volume {volume_ratio:.2f}x average",
+        ),
+    )
+
+
+def format_price(price: float) -> str:
+    if price >= 1000:
+        return f"{price:,.2f}"
+
+    if price >= 1:
+        return f"{price:.4f}"
+
+    return f"{price:.6f}"
 
 
 def format_signal(signal: Signal) -> str:
-    reasons = "\n".join(f"• {reason}" for reason in signal.reasons)
-    risk = abs(signal.entry - signal.stop)
+    reason_text = "\n".join(
+        f"✅ {reason}"
+        for reason in signal.reasons
+    )
+
+    risk_distance = abs(
+        signal.entry - signal.stop_loss
+    )
+
     return (
-        f"📊 {signal.symbol} — {signal.side}\n\n"
-        f"Entry: {signal.entry:.8g}\n"
-        f"Stop: {signal.stop:.8g}\n"
-        f"TP1: {signal.target_1:.8g}\n"
-        f"TP2: {signal.target_2:.8g}\n"
-        f"Risk distance: {risk:.8g}\n\n"
-        f"{reasons}\n\n"
-        "Alert-only signal. Validate liquidity, spread, and news risk before trading."
+        f"📊 {signal.symbol}\n"
+        f"Signal: {signal.side}\n\n"
+        f"Entry: {format_price(signal.entry)}\n"
+        f"Stop Loss: {format_price(signal.stop_loss)}\n"
+        f"Target 1: {format_price(signal.target_1)}\n"
+        f"Target 2: {format_price(signal.target_2)}\n"
+        f"Risk distance: {format_price(risk_distance)}\n\n"
+        f"{reason_text}\n\n"
+        "⚠️ Alert only. This is not guaranteed financial advice."
     )
 
 
-def send_telegram(text: str) -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+def send_telegram(message: str) -> None:
+    token = os.getenv(
+        "TELEGRAM_BOT_TOKEN",
+        "",
+    ).strip()
+
+    chat_id = os.getenv(
+        "TELEGRAM_CHAT_ID",
+        "",
+    ).strip()
+
     if not token or not chat_id:
-        log.info("\n%s", text)
+        log.warning(
+            "Telegram secrets are missing. Printing signal instead."
+        )
+        log.info("\n%s", message)
         return
 
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{token}/sendMessage"
+    )
+
     response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": text},
+        url,
+        json={
+            "chat_id": chat_id,
+            "text": message,
+        },
         timeout=20,
     )
+
     response.raise_for_status()
 
 
 def main() -> None:
-    cfg = load_config()
-    exchange_id = os.getenv("EXCHANGE_ID", "binance")
-    interval = max(30, int(os.getenv("SCAN_INTERVAL_SECONDS", "60")))
-    exchange = make_exchange(exchange_id)
-    conn = init_db()
+    config = load_config()
 
-    available = [s for s in cfg["symbols"] if s in exchange.markets]
-    missing = sorted(set(cfg["symbols"]) - set(available))
-    if missing:
-        log.warning("Unavailable on %s: %s", exchange_id, ", ".join(missing))
+    exchange_id = os.getenv(
+        "EXCHANGE_ID",
+        "binance",
+    )
 
-    log.info("Scanning %s on %s", ", ".join(available), exchange_id)
+    exchange = create_exchange(exchange_id)
 
-    while True:
-        for symbol in available:
-            try:
-                signal = generate_signal(exchange, symbol, cfg)
-                if signal and signal_is_new(
-                    conn, signal, int(cfg["signal_cooldown_minutes"])
-                ):
-                    send_telegram(format_signal(signal))
-                else:
-                    log.info("%s: no new qualified setup", symbol)
-            except (ccxt.NetworkError, ccxt.ExchangeError, requests.RequestException) as exc:
-                log.warning("%s temporary API error: %s", symbol, exc)
-            except Exception:
-                log.exception("%s scan failed", symbol)
-        time.sleep(interval)
+    configured_symbols = config["symbols"]
+
+    available_symbols = [
+        symbol
+        for symbol in configured_symbols
+        if symbol in exchange.markets
+    ]
+
+    missing_symbols = sorted(
+        set(configured_symbols)
+        - set(available_symbols)
+    )
+
+    if missing_symbols:
+        log.warning(
+            "Unavailable symbols on %s: %s",
+            exchange_id,
+            ", ".join(missing_symbols),
+        )
+
+    log.info(
+        "Scanning %s symbols on %s",
+        len(available_symbols),
+        exchange_id,
+    )
+
+    signals_found = 0
+
+    for symbol in available_symbols:
+        try:
+            log.info("Checking %s", symbol)
+
+            signal = generate_signal(
+                exchange,
+                symbol,
+                config,
+            )
+
+            if signal is None:
+                log.info(
+                    "%s | No qualified setup",
+                    symbol,
+                )
+                continue
+
+            signals_found += 1
+
+            message = format_signal(signal)
+
+            send_telegram(message)
+
+            log.info(
+                "%s | %s signal sent",
+                symbol,
+                signal.side,
+            )
+
+        except (
+            ccxt.NetworkError,
+            ccxt.ExchangeError,
+            requests.RequestException,
+        ) as error:
+            log.warning(
+                "%s | API error: %s",
+                symbol,
+                error,
+            )
+
+        except Exception:
+            log.exception(
+                "%s | Unexpected scan failure",
+                symbol,
+            )
+
+    log.info(
+        "Scan complete. Signals found: %s",
+        signals_found,
+    )
 
 
 if __name__ == "__main__":
