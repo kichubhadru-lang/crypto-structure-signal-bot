@@ -13,13 +13,13 @@
   "setup_timeframe": "1h",
   "entry_timeframe": "15m",
   "candle_limit": 500,
-  "swing_left": 3,
-  "swing_right": 3,
+  "swing_left": 2,
+  "swing_right": 2,
+  "recent_bos_window": 16,
   "volume_sma_period": 20,
   "atr_period": 14,
-  "minimum_volume_ratio": 1.1,
-  "pullback_atr_tolerance": 0.4,
+  "minimum_volume_ratio": 0.75,
+  "pullback_atr_tolerance": 0.8,
   "stop_atr_buffer": 0.2,
-  "minimum_rr": 2.0,
-  "signal_cooldown_minutes": 180
+  "minimum_rr": 1.5
 }
