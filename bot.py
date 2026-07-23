@@ -6,6 +6,7 @@ import math
 import os
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -90,6 +91,7 @@ class Signal:
     volume_ratio: float
     candle_timestamp: int
     pattern_key: str
+    trade_id: str
     reasons: tuple[str, ...]
 
 
@@ -540,6 +542,10 @@ def build_signal(exchange, symbol: str, btc_trend: str, performance: dict) -> Op
         tp2 = close - risk * TP2_RR
         tp3 = close - risk * TP3_RR
 
+    row_timestamp = int(row["timestamp"])
+    asset_code = symbol.split("/")[0]
+    trade_id = f"{asset_code}-{side[0]}-{row_timestamp // 1000}"
+
     signal = Signal(
         symbol=symbol,
         side=side,
@@ -555,8 +561,9 @@ def build_signal(exchange, symbol: str, btc_trend: str, performance: dict) -> Op
         adx=adx,
         atr_percent=atr_percent,
         volume_ratio=volume_ratio,
-        candle_timestamp=int(row["timestamp"]),
+        candle_timestamp=row_timestamp,
         pattern_key=pkey,
+        trade_id=trade_id,
         reasons=reasons,
     )
     return signal, m15
@@ -607,6 +614,10 @@ def record_open_signal(signal: Signal, performance: dict) -> None:
         "timestamp": signal.candle_timestamp,
         "confidence": signal.adaptive_confidence,
         "pattern_key": signal.pattern_key,
+        "trade_id": signal.trade_id,
+        "hit_tp1": False,
+        "hit_tp2": False,
+        "hit_tp3": False,
     }
 
 
@@ -614,7 +625,7 @@ def update_outcomes(exchange, performance: dict) -> list[str]:
     open_signals = performance.setdefault("open_signals", {})
     closed = performance.setdefault("closed_signals", [])
     stats = performance.setdefault("pattern_stats", {})
-    updates = []
+    updates: list[str] = []
 
     for key, trade in list(open_signals.items()):
         try:
@@ -626,54 +637,80 @@ def update_outcomes(exchange, performance: dict) -> list[str]:
             side = trade["side"]
             sl = float(trade["stop_loss"])
             tp1 = float(trade["target_1"])
+            tp2 = float(trade["target_2"])
+            tp3 = float(trade["target_3"])
+            trade_id = trade.get("trade_id", key)
 
-            outcome = None
+            closed_now = False
+            final_outcome = None
             exit_price = None
             exit_time = None
 
             for row in future.itertuples():
                 if side == "BUY":
                     hit_sl = row.low <= sl
-                    hit_tp = row.high >= tp1
+                    hit_1 = row.high >= tp1
+                    hit_2 = row.high >= tp2
+                    hit_3 = row.high >= tp3
                 else:
                     hit_sl = row.high >= sl
-                    hit_tp = row.low <= tp1
+                    hit_1 = row.low <= tp1
+                    hit_2 = row.low <= tp2
+                    hit_3 = row.low <= tp3
 
-                if hit_sl and hit_tp:
-                    outcome = "LOSS"
-                    exit_price = sl
-                    exit_time = int(row.timestamp)
-                    break
+                # Conservative handling when both stop and target are touched in one candle.
                 if hit_sl:
-                    outcome = "LOSS"
+                    final_outcome = "WIN" if trade.get("hit_tp1") else "LOSS"
                     exit_price = sl
                     exit_time = int(row.timestamp)
-                    break
-                if hit_tp:
-                    outcome = "WIN"
-                    exit_price = tp1
-                    exit_time = int(row.timestamp)
+                    status = "PROTECTED WIN" if trade.get("hit_tp1") else "STOP LOSS"
+                    updates.append(
+                        f"â {trade_id} | {trade['symbol']} {side} | {status} hit at {format_price(sl)}"
+                    )
+                    closed_now = True
                     break
 
-            if outcome is None:
+                if hit_1 and not trade.get("hit_tp1"):
+                    trade["hit_tp1"] = True
+                    updates.append(
+                        f"â {trade_id} | {trade['symbol']} {side} | TP1 hit at {format_price(tp1)}"
+                    )
+
+                if hit_2 and not trade.get("hit_tp2"):
+                    trade["hit_tp2"] = True
+                    updates.append(
+                        f"ð¯ {trade_id} | {trade['symbol']} {side} | TP2 hit at {format_price(tp2)}"
+                    )
+
+                if hit_3 and not trade.get("hit_tp3"):
+                    trade["hit_tp3"] = True
+                    updates.append(
+                        f"ð {trade_id} | {trade['symbol']} {side} | TP3 hit at {format_price(tp3)}"
+                    )
+                    final_outcome = "WIN"
+                    exit_price = tp3
+                    exit_time = int(row.timestamp)
+                    closed_now = True
+                    break
+
+            if not closed_now:
                 continue
 
             pattern = trade.get("pattern_key", "UNKNOWN")
             pstats = stats.setdefault(pattern, {"trades": 0, "wins": 0, "losses": 0})
             pstats["trades"] += 1
-            if outcome == "WIN":
+            if final_outcome == "WIN":
                 pstats["wins"] += 1
             else:
                 pstats["losses"] += 1
 
             closed.append({
                 **trade,
-                "outcome": outcome,
+                "outcome": final_outcome,
                 "exit_price": exit_price,
                 "exit_time": exit_time,
             })
             del open_signals[key]
-            updates.append(f"{trade['symbol']} {side}: {outcome}")
 
         except Exception as exc:
             log.warning("Outcome update failed for %s: %s", trade.get("symbol"), exc)
@@ -682,7 +719,6 @@ def update_outcomes(exchange, performance: dict) -> list[str]:
         performance["closed_signals"] = closed[-500:]
 
     return updates
-
 
 def performance_summary(performance: dict) -> str:
     closed = performance.get("closed_signals", [])
@@ -710,28 +746,54 @@ def format_price(value: float) -> str:
     return f"{value:.7f}"
 
 
-def format_signal(signal: Signal) -> str:
-    reasons = "\n".join(f"✅ {reason}" for reason in signal.reasons)
-    return (
-        f"🧠 V3.6 ADAPTIVE {signal.grade}\n\n"
-        f"Pair: {signal.symbol}\n"
-        f"Direction: {signal.side}\n"
-        f"Raw score: {signal.raw_confidence}%\n"
-        f"Adaptive score: {signal.adaptive_confidence}%\n"
-        f"Pattern: {signal.pattern_key}\n\n"
-        f"Entry: {format_price(signal.entry)}\n"
-        f"Stop Loss: {format_price(signal.stop_loss)}\n"
-        f"TP1 (1.5R): {format_price(signal.target_1)}\n"
-        f"TP2 (2R): {format_price(signal.target_2)}\n"
-        f"TP3 (3R): {format_price(signal.target_3)}\n\n"
-        f"RSI: {signal.rsi:.1f}\n"
-        f"ADX: {signal.adx:.1f}\n"
-        f"Volume: {signal.volume_ratio:.2f}x\n"
-        f"ATR: {signal.atr_percent:.2f}%\n\n"
-        f"{reasons}\n\n"
-        "⚠️ Alert only. Historical adaptation does not guarantee future profit."
-    )
+def percentage_move(entry: float, target: float, side: str) -> float:
+    if side == "BUY":
+        return ((target - entry) / entry) * 100
+    return ((entry - target) / entry) * 100
 
+
+def signal_strength(confidence: int) -> str:
+    if confidence >= 90:
+        return "STRONG"
+    if confidence >= 82:
+        return "GOOD"
+    return "WATCH"
+
+
+def format_signal(signal: Signal) -> str:
+    reasons = "\n".join(f"â {reason}" for reason in signal.reasons)
+    signal_time = datetime.fromtimestamp(
+        signal.candle_timestamp / 1000, tz=timezone.utc
+    ).strftime("%d %b %Y, %H:%M UTC")
+
+    sl_percent = abs(percentage_move(signal.entry, signal.stop_loss, signal.side))
+    tp1_percent = percentage_move(signal.entry, signal.target_1, signal.side)
+    tp2_percent = percentage_move(signal.entry, signal.target_2, signal.side)
+    tp3_percent = percentage_move(signal.entry, signal.target_3, signal.side)
+    direction_icon = "ð¢" if signal.side == "BUY" else "ð´"
+
+    return (
+        f"{direction_icon} V4 FINAL CRYPTO SIGNAL\n"
+        f"ââââââââââââââââââ\n"
+        f"ð·ï¸ Trade ID: {signal.trade_id}\n"
+        f"ð± Pair: {signal.symbol}\n"
+        f"ð Direction: {signal.side}\n"
+        f"â­ Grade: {signal.grade} | {signal_strength(signal.adaptive_confidence)}\n"
+        f"ð§  Confidence: {signal.adaptive_confidence}% "
+        f"(Raw {signal.raw_confidence}%)\n"
+        f"ð Signal time: {signal_time}\n\n"
+        f"ð° Entry: {format_price(signal.entry)}\n"
+        f"ð Stop Loss: {format_price(signal.stop_loss)} (-{sl_percent:.2f}%)\n"
+        f"ð¯ TP1: {format_price(signal.target_1)} (+{tp1_percent:.2f}%) | 1.5R\n"
+        f"ð¯ TP2: {format_price(signal.target_2)} (+{tp2_percent:.2f}%) | 2R\n"
+        f"ð TP3: {format_price(signal.target_3)} (+{tp3_percent:.2f}%) | 3R\n\n"
+        f"ð MARKET DATA\n"
+        f"RSI: {signal.rsi:.1f} | ADX: {signal.adx:.1f}\n"
+        f"Volume: {signal.volume_ratio:.2f}x | ATR: {signal.atr_percent:.2f}%\n"
+        f"Pattern: {signal.pattern_key}\n\n"
+        f"ð CONFIRMATIONS\n{reasons}\n\n"
+        "â ï¸ Signal alert only. Confirm the chart and use controlled risk."
+    )
 
 def telegram_credentials() -> tuple[str, str]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -822,6 +884,11 @@ def main() -> None:
     )
 
     outcome_updates = update_outcomes(exchange, performance)
+    for update in outcome_updates:
+        try:
+            send_telegram_text(update)
+        except requests.RequestException as exc:
+            log.warning("Could not send outcome update: %s", exc)
 
     btc_4h = add_indicators(fetch_candles(exchange, BTC_SYMBOL, HTF))
     btc_trend = trend_direction(btc_4h)
@@ -852,7 +919,7 @@ def main() -> None:
             chart_path = create_chart(chart_df, signal)
             send_telegram_photo(
                 chart_path,
-                f"{signal.symbol} {signal.side} | {signal.grade} | {signal.adaptive_confidence}%",
+                f"{signal.trade_id} | {signal.symbol} {signal.side} | {signal.grade} | {signal.adaptive_confidence}%",
             )
 
             remember_signal(signal, state)
@@ -874,20 +941,20 @@ def main() -> None:
     save_json(PERFORMANCE_FILE, performance)
 
     summary = (
-        "✅ V3.6 Adaptive scan completed\n\n"
+        "â V4 Final scanner completed\n\n"
         f"BTC 4H regime: {btc_trend.upper()}\n"
         f"Pairs scanned: {len(scan_symbols)}\n"
         f"New signals: {len(new_signals)}\n"
-        f"Resolved outcomes: {len(outcome_updates)}\n"
+        f"Outcome updates: {len(outcome_updates)}\n"
         f"Errors: {len(errors)}\n\n"
         f"{performance_summary(performance)}"
     )
 
     if btc_trend == "neutral" and SKIP_ALTS_WHEN_BTC_NEUTRAL:
-        summary += "\n\n⏸️ Altcoins skipped because BTC 4H is neutral."
+        summary += "\n\nâ¸ï¸ Altcoins skipped because BTC 4H is neutral."
 
     if outcome_updates:
-        summary += "\n\nLatest outcomes:\n" + "\n".join(f"• {item}" for item in outcome_updates[:10])
+        summary += "\n\nLatest outcomes:\n" + "\n".join(f"â¢ {item}" for item in outcome_updates[:10])
 
     if SEND_EMPTY_SUMMARY or new_signals or outcome_updates:
         send_telegram_text(summary)
