@@ -1,32 +1,53 @@
-name: Crypto Structure Scanner
+name: Crypto V3 Pro Scanner
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-v3-pro
+  cancel-in-progress: false
 
 jobs:
-  scan-market:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Download repository
         uses: actions/checkout@v4
 
+      - name: Restore signal state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: crypto-state-${{ github.run_id }}
+          restore-keys: |
+            crypto-state-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
 
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      - name: Run market structure scanner
+      - name: Run V3 Pro scanner
         env:
           EXCHANGE_ID: kucoin
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
+
+      - name: Save signal state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: crypto-state-${{ github.run_id }}
