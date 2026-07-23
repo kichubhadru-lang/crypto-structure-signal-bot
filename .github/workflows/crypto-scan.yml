@@ -1,4 +1,4 @@
-name: Crypto V3.5 Institutional Scanner
+name: Crypto V3.6 Adaptive Scanner
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: crypto-v35-institutional
+  group: crypto-v36-adaptive
   cancel-in-progress: false
 
 jobs:
@@ -27,8 +27,9 @@ jobs:
           path: |
             state.json
             performance.json
-          key: crypto-v35-state-${{ github.run_id }}
+          key: crypto-v36-state-${{ github.run_id }}
           restore-keys: |
+            crypto-v36-state-
             crypto-v35-state-
 
       - name: Set up Python
@@ -42,7 +43,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run V3.5 Institutional Scanner
+      - name: Run V3.6 Adaptive Scanner
         env:
           EXCHANGE_ID: kucoin
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -56,4 +57,4 @@ jobs:
           path: |
             state.json
             performance.json
-          key: crypto-v35-state-${{ github.run_id }}
+          key: crypto-v36-state-${{ github.run_id }}
