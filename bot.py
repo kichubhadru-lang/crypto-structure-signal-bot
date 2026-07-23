@@ -665,7 +665,7 @@ def update_outcomes(exchange, performance: dict) -> list[str]:
                     exit_time = int(row.timestamp)
                     status = "PROTECTED WIN" if trade.get("hit_tp1") else "STOP LOSS"
                     updates.append(
-                        f"â {trade_id} | {trade['symbol']} {side} | {status} hit at {format_price(sl)}"
+                        f"❌ {trade_id} | {trade['symbol']} {side} | {status} hit at {format_price(sl)}"
                     )
                     closed_now = True
                     break
@@ -673,19 +673,19 @@ def update_outcomes(exchange, performance: dict) -> list[str]:
                 if hit_1 and not trade.get("hit_tp1"):
                     trade["hit_tp1"] = True
                     updates.append(
-                        f"â {trade_id} | {trade['symbol']} {side} | TP1 hit at {format_price(tp1)}"
+                        f"✅ {trade_id} | {trade['symbol']} {side} | TP1 hit at {format_price(tp1)}"
                     )
 
                 if hit_2 and not trade.get("hit_tp2"):
                     trade["hit_tp2"] = True
                     updates.append(
-                        f"ð¯ {trade_id} | {trade['symbol']} {side} | TP2 hit at {format_price(tp2)}"
+                        f"🎯 {trade_id} | {trade['symbol']} {side} | TP2 hit at {format_price(tp2)}"
                     )
 
                 if hit_3 and not trade.get("hit_tp3"):
                     trade["hit_tp3"] = True
                     updates.append(
-                        f"ð {trade_id} | {trade['symbol']} {side} | TP3 hit at {format_price(tp3)}"
+                        f"🏆 {trade_id} | {trade['symbol']} {side} | TP3 hit at {format_price(tp3)}"
                     )
                     final_outcome = "WIN"
                     exit_price = tp3
@@ -761,7 +761,7 @@ def signal_strength(confidence: int) -> str:
 
 
 def format_signal(signal: Signal) -> str:
-    reasons = "\n".join(f"â {reason}" for reason in signal.reasons)
+    reasons = "\n".join(f"✅ {reason}" for reason in signal.reasons)
     signal_time = datetime.fromtimestamp(
         signal.candle_timestamp / 1000, tz=timezone.utc
     ).strftime("%d %b %Y, %H:%M UTC")
@@ -770,29 +770,29 @@ def format_signal(signal: Signal) -> str:
     tp1_percent = percentage_move(signal.entry, signal.target_1, signal.side)
     tp2_percent = percentage_move(signal.entry, signal.target_2, signal.side)
     tp3_percent = percentage_move(signal.entry, signal.target_3, signal.side)
-    direction_icon = "ð¢" if signal.side == "BUY" else "ð´"
+    direction_icon = "🟢" if signal.side == "BUY" else "🔴"
 
     return (
         f"{direction_icon} V4 FINAL CRYPTO SIGNAL\n"
-        f"ââââââââââââââââââ\n"
-        f"ð·ï¸ Trade ID: {signal.trade_id}\n"
-        f"ð± Pair: {signal.symbol}\n"
-        f"ð Direction: {signal.side}\n"
-        f"â­ Grade: {signal.grade} | {signal_strength(signal.adaptive_confidence)}\n"
-        f"ð§  Confidence: {signal.adaptive_confidence}% "
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏷️ Trade ID: {signal.trade_id}\n"
+        f"💱 Pair: {signal.symbol}\n"
+        f"📍 Direction: {signal.side}\n"
+        f"⭐ Grade: {signal.grade} | {signal_strength(signal.adaptive_confidence)}\n"
+        f"🧠 Confidence: {signal.adaptive_confidence}% "
         f"(Raw {signal.raw_confidence}%)\n"
-        f"ð Signal time: {signal_time}\n\n"
-        f"ð° Entry: {format_price(signal.entry)}\n"
-        f"ð Stop Loss: {format_price(signal.stop_loss)} (-{sl_percent:.2f}%)\n"
-        f"ð¯ TP1: {format_price(signal.target_1)} (+{tp1_percent:.2f}%) | 1.5R\n"
-        f"ð¯ TP2: {format_price(signal.target_2)} (+{tp2_percent:.2f}%) | 2R\n"
-        f"ð TP3: {format_price(signal.target_3)} (+{tp3_percent:.2f}%) | 3R\n\n"
-        f"ð MARKET DATA\n"
+        f"🕒 Signal time: {signal_time}\n\n"
+        f"💰 Entry: {format_price(signal.entry)}\n"
+        f"🛑 Stop Loss: {format_price(signal.stop_loss)} (-{sl_percent:.2f}%)\n"
+        f"🎯 TP1: {format_price(signal.target_1)} (+{tp1_percent:.2f}%) | 1.5R\n"
+        f"🎯 TP2: {format_price(signal.target_2)} (+{tp2_percent:.2f}%) | 2R\n"
+        f"🏆 TP3: {format_price(signal.target_3)} (+{tp3_percent:.2f}%) | 3R\n\n"
+        f"📊 MARKET DATA\n"
         f"RSI: {signal.rsi:.1f} | ADX: {signal.adx:.1f}\n"
         f"Volume: {signal.volume_ratio:.2f}x | ATR: {signal.atr_percent:.2f}%\n"
         f"Pattern: {signal.pattern_key}\n\n"
-        f"ð CONFIRMATIONS\n{reasons}\n\n"
-        "â ï¸ Signal alert only. Confirm the chart and use controlled risk."
+        f"📋 CONFIRMATIONS\n{reasons}\n\n"
+        "⚠️ Signal alert only. Confirm the chart and use controlled risk."
     )
 
 def telegram_credentials() -> tuple[str, str]:
@@ -941,7 +941,7 @@ def main() -> None:
     save_json(PERFORMANCE_FILE, performance)
 
     summary = (
-        "â V4 Final scanner completed\n\n"
+        "✅ V4 Final scanner completed\n\n"
         f"BTC 4H regime: {btc_trend.upper()}\n"
         f"Pairs scanned: {len(scan_symbols)}\n"
         f"New signals: {len(new_signals)}\n"
@@ -951,10 +951,10 @@ def main() -> None:
     )
 
     if btc_trend == "neutral" and SKIP_ALTS_WHEN_BTC_NEUTRAL:
-        summary += "\n\nâ¸ï¸ Altcoins skipped because BTC 4H is neutral."
+        summary += "\n\n⏸️ Altcoins skipped because BTC 4H is neutral."
 
     if outcome_updates:
-        summary += "\n\nLatest outcomes:\n" + "\n".join(f"â¢ {item}" for item in outcome_updates[:10])
+        summary += "\n\nLatest outcomes:\n" + "\n".join(f"• {item}" for item in outcome_updates[:10])
 
     if SEND_EMPTY_SUMMARY or new_signals or outcome_updates:
         send_telegram_text(summary)
